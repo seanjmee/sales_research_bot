@@ -44,7 +44,7 @@ flask_app = Flask(__name__)
 
 # Google OAuth config
 SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
-REDIRECT_URI = 'http://localhost:3000/oauth/callback'
+REDIRECT_URI = os.environ.get('OAUTH_REDIRECT_URI', 'http://localhost:3000/oauth/callback')
 
 # Simple token storage (upgrade to DB later)
 def load_tokens():
