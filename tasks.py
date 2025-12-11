@@ -134,7 +134,33 @@ def trigger_research_with_context(company_name, slack_user_id, meeting_summary, 
             mrkdwn=True
         )
         
-        print(f"✅ Sent research for {company_name} to {slack_user_id}")
+        # Store context for follow-up questions (shared with app.py via file)
+        def load_research_contexts():
+            try:
+                with open('research_contexts.json', 'r') as f:
+                    content = f.read().strip()
+                    if not content:
+                        return {}
+                    return json.loads(content)
+            except (FileNotFoundError, json.JSONDecodeError):
+                return {}
+        
+        def save_research_contexts(contexts):
+            with open('research_contexts.json', 'w') as f:
+                json.dump(contexts, f, indent=2)
+        
+        contexts = load_research_contexts()
+        context_key = f"{dm_channel_id}_{thread_ts}"
+        contexts[context_key] = {
+            'company': company_name,
+            'research_brief': brief,
+            'created_at': datetime.utcnow().isoformat(),
+            'conversation': [],
+            'meeting_summary': meeting_summary
+        }
+        save_research_contexts(contexts)
+        
+        print(f"✅ Sent research for {company_name} to {slack_user_id} and stored context")
     except Exception as e:
         print(f"❌ Error generating research: {e}")
         import traceback

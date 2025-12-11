@@ -177,8 +177,25 @@ Use markdown formatting for the output."""
     
     return message.content[0].text
 
-# Store active research contexts (in-memory for now, will move to DB later)
-research_contexts = {}
+# Store active research contexts (file-based for Celery compatibility)
+def load_research_contexts():
+    """Load research contexts from file"""
+    try:
+        with open('research_contexts.json', 'r') as f:
+            content = f.read().strip()
+            if not content:
+                return {}
+            return json.loads(content)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_research_contexts(contexts):
+    """Save research contexts to file"""
+    with open('research_contexts.json', 'w') as f:
+        json.dump(contexts, f, indent=2)
+
+# In-memory cache (synced with file)
+research_contexts = load_research_contexts()
 
 @slack_app.event("message")
 def handle_message_events(event, say, client):
@@ -196,6 +213,9 @@ def handle_message_events(event, say, client):
     # Check if this thread has an active research context
     context_key = f"{event['channel']}_{thread_ts}"
     
+    # Reload contexts from file (in case Celery task updated it)
+    research_contexts.update(load_research_contexts())
+    
     if context_key not in research_contexts:
         return  # Not a research thread, ignore
     
@@ -209,6 +229,7 @@ def handle_message_events(event, say, client):
             thread_ts=thread_ts
         )
         del research_contexts[context_key]
+        save_research_contexts(research_contexts)
         return
     
     # Get user's question
@@ -267,6 +288,7 @@ Now the user has a follow-up question. Answer it based on the research context a
         conversation_history.append({"role": "assistant", "content": answer})
         context['conversation'] = conversation_history
         research_contexts[context_key] = context
+        save_research_contexts(research_contexts)
         
         print(f"✅ Answered follow-up in thread {thread_ts}")
         
@@ -359,7 +381,7 @@ def handle_research_command(ack, say, command, client):
         return
     
     # Send initial message
-    response = say(f"🔍 Researching {company}... this will take ~30 seconds")
+    say(f"🔍 Researching {company}... this will take ~30 seconds")
     
     try:
         brief = research_company(company)
@@ -381,6 +403,7 @@ def handle_research_command(ack, say, command, client):
             'created_at': datetime.utcnow().isoformat(),
             'conversation': []
         }
+        save_research_contexts(research_contexts)
         
         print(f"✅ Created research context: {context_key}")
         
