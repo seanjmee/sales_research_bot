@@ -157,15 +157,17 @@ def get_upcoming_meetings(slack_user_id):
 # Research function
 def research_company(company_name):
     """Generate a simple research brief using Claude"""
-    prompt = f"""You are a sales research assistant. Create a brief company overview for {company_name} that would help a sales person prepare for a meeting.
+    prompt = f"""You are a sales research assistant working for OutSystems, based out of the Boston office. You are an expert Solutions Architect and deep expert on enterprise software development and agentic AI. Create a brief company overview for {company_name} that would help a sales person prepare for a meeting to sell OutSystems' platform.
 
 Include:
-- What the company does
-- Industry and size (estimate if needed)
-- Recent news or developments
-- Potential pain points a sales person should know
+- 📈What the company does
+- 📊Industry and size (estimate if needed)
+- 📰Recent news or developments
+- 💡Potential pain points a sales person should know
 
-Keep it concise - 3-4 paragraphs max."""
+Keep it concise - 3-4 paragraphs max.
+
+Use markdown formatting for the output."""
 
     message = claude.messages.create(
         model="claude-sonnet-4-20250514",
@@ -260,23 +262,59 @@ def handle_upcoming_meetings(ack, say, command):
         say("No meetings found in the next 24-48 hours.")
         return
     
-    try:
-        message = "*📅 Your upcoming meetings (next 24-48 hours):*\n\n"
-        for event in meetings:
-            start = event['start'].get('dateTime', event['start'].get('date'))
-            summary = event.get('summary', 'No title')
-            attendees = event.get('attendees', [])
-            
-            message += f"• *{summary}*\n"
-            message += f"  Time: {start}\n"
-            if attendees:
-                message += f"  Attendees: {len(attendees)} people\n"
-            message += "\n"
+    # Build message with interactive buttons
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "📅 Your upcoming meetings (next 24-48 hours):"
+            }
+        }
+    ]
+    
+    for i, event in enumerate(meetings):
+        start = event['start'].get('dateTime', event['start'].get('date'))
+        summary = event.get('summary', 'No title')
+        attendees = event.get('attendees', [])
         
-        say(message, mrkdwn=True)
-    except Exception as e:
-        print(f"Error formatting meetings: {e}")
-        say(f"❌ Error displaying meetings: {str(e)}")
+        # Extract external attendee domains (potential companies)
+        external_domains = set()
+        for attendee in attendees:
+            email = attendee.get('email', '')
+            if '@' in email and 'gmail.com' not in email:
+                domain = email.split('@')[1]
+                external_domains.add(domain)
+        
+        meeting_text = f"*{summary}*\n{start}"
+        if attendees:
+            meeting_text += f"\n{len(attendees)} attendees"
+        if external_domains:
+            meeting_text += f"\n Companies: {', '.join(external_domains)}"
+        
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": meeting_text
+            },
+            "accessory": {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "🔍 Research"
+                },
+                "value": json.dumps({
+                    "meeting_id": event.get('id'),
+                    "summary": summary,
+                    "domains": list(external_domains)
+                }),
+                "action_id": f"research_meeting_{i}"
+            }
+        })
+        blocks.append({"type": "divider"})
+    
+    say(blocks=blocks, text="Your upcoming meetings")
 
 @slack_app.message(re.compile(r"^(hello|hi|hey)$", re.IGNORECASE))
 def say_hello(message, say):
@@ -310,7 +348,7 @@ def handle_mention(event, say):
     
     # Otherwise, treat as company name
     company = text.strip()
-    say(f"🔍 Researching {company}... this will take ~30 seconds")
+    say(f"🔍 Researching {company}... this will take ~30-60 seconds")
     
     try:
         brief = research_company(company)
@@ -382,6 +420,35 @@ def oauth_callback():
 # Run both Flask and Slack bot
 def run_flask():
     flask_app.run(port=3000)
+
+@slack_app.action("research_meeting_0")
+@slack_app.action("research_meeting_1")
+@slack_app.action("research_meeting_2")
+@slack_app.action("research_meeting_3")
+@slack_app.action("research_meeting_4")
+def handle_research_button(ack, body, say):
+    ack()
+    
+    value = json.loads(body['actions'][0]['value'])
+    meeting_summary = value['summary']
+    domains = value['domains']
+    
+    if not domains:
+        say(f"❌ Couldn't find a company to research for '{meeting_summary}'. Try `/research Company Name` manually.")
+        return
+    
+    # Research the first company found
+    company = domains[0].replace('.com', '').replace('.', ' ').title()
+    
+    say(f"🔍 Researching {company} for your meeting: *{meeting_summary}*...")
+    
+    try:
+        brief = research_company(company)
+        # Convert markdown and send with mrkdwn enabled
+        formatted_brief = convert_markdown_to_slack(brief)
+        say(f"*Research Brief: {company}*\n\n{formatted_brief}\n\n_Ask me follow-up questions in this thread!_", mrkdwn=True)
+    except Exception as e:
+        say(f"❌ Sorry, something went wrong: {str(e)}")
 
 if __name__ == "__main__":
     print("⚡️ Bot is running in Socket Mode!")
