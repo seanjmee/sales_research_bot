@@ -177,31 +177,178 @@ Use markdown formatting for the output."""
     
     return message.content[0].text
 
+# Store active research contexts (in-memory for now, will move to DB later)
+research_contexts = {}
+
+@slack_app.event("message")
+def handle_message_events(event, say, client):
+    """Handle all messages, including threaded replies"""
+    
+    # Ignore bot's own messages
+    if event.get('bot_id'):
+        return
+    
+    # Only handle threaded messages (replies)
+    thread_ts = event.get('thread_ts')
+    if not thread_ts:
+        return  # Not a thread, ignore
+    
+    # Check if this thread has an active research context
+    context_key = f"{event['channel']}_{thread_ts}"
+    
+    if context_key not in research_contexts:
+        return  # Not a research thread, ignore
+    
+    context = research_contexts[context_key]
+    
+    # Check if context has expired (48 hours)
+    created_at = datetime.fromisoformat(context['created_at'])
+    if datetime.utcnow() - created_at > timedelta(hours=48):
+        say(
+            "⏰ This research thread has expired (48 hours old). Run a new research to ask more questions!",
+            thread_ts=thread_ts
+        )
+        del research_contexts[context_key]
+        return
+    
+    # Get user's question
+    user_question = event['text']
+    
+    # Generate response with context
+    try:
+        conversation_history = context.get('conversation', [])
+        
+        # Build prompt with original research + conversation history
+        messages = [
+            {
+                "role": "user",
+                "content": f"""You are a sales research assistant. Here's the research brief you provided earlier:
+
+{context['research_brief']}
+
+Company: {context['company']}
+Meeting: {context.get('meeting_summary', 'N/A')}
+
+Now the user has a follow-up question. Answer it based on the research context and your knowledge."""
+            },
+            {
+                "role": "assistant",
+                "content": "I'll answer your follow-up questions based on the research."
+            }
+        ]
+        
+        # Add conversation history
+        for msg in conversation_history:
+            messages.append({"role": msg["role"], "content": msg["content"]})
+        
+        # Add current question
+        messages.append({"role": "user", "content": user_question})
+        
+        # Call Claude
+        response = claude.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1000,
+            messages=messages
+        )
+        
+        answer = response.content[0].text
+        
+        # Convert markdown and send response in thread
+        formatted_answer = convert_markdown_to_slack(answer)
+        client.chat_postMessage(
+            channel=event['channel'],
+            thread_ts=thread_ts,
+            text=formatted_answer,
+            mrkdwn=True
+        )
+        
+        # Update conversation history
+        conversation_history.append({"role": "user", "content": user_question})
+        conversation_history.append({"role": "assistant", "content": answer})
+        context['conversation'] = conversation_history
+        research_contexts[context_key] = context
+        
+        print(f"✅ Answered follow-up in thread {thread_ts}")
+        
+    except Exception as e:
+        print(f"❌ Error handling follow-up: {e}")
+        client.chat_postMessage(
+            channel=event['channel'],
+            thread_ts=thread_ts,
+            text=f"❌ Sorry, I couldn't answer that: {str(e)}"
+        )
+
 # Markdown conversion helper
 def convert_markdown_to_slack(text):
     """Convert common markdown to Slack's mrkdwn format"""
-    # Convert headers to bold
-    text = re.sub(r'^### (.+)$', r'*\1*', text, flags=re.MULTILINE)
-    text = re.sub(r'^## (.+)$', r'*\1*', text, flags=re.MULTILINE)
-    text = re.sub(r'^# (.+)$', r'*\1*', text, flags=re.MULTILINE)
+    # Split into lines for better processing
+    lines = text.split('\n')
+    result_lines = []
     
-    # Convert markdown links [text](url) to Slack format <url|text>
-    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
+    for line in lines:
+        # Convert headers to bold (handle with/without leading spaces and emojis)
+        if re.match(r'^\s*###\s+(.+)$', line):
+            line = re.sub(r'^\s*###\s+(.+)$', r'*\1*', line)
+        elif re.match(r'^\s*##\s+(.+)$', line):
+            line = re.sub(r'^\s*##\s+(.+)$', r'*\1*', line)
+        elif re.match(r'^\s*#\s+(.+)$', line):
+            line = re.sub(r'^\s*#\s+(.+)$', r'*\1*', line)
+        else:
+            # Convert markdown bold **text** to Slack *text* (but not if already in a header)
+            # Handle bold text that might span multiple words
+            line = re.sub(r'\*\*([^*\n]+?)\*\*', r'*\1*', line)
+            
+            # Convert markdown links [text](url) to Slack format <url|text>
+            line = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', line)
+            
+            # Ensure bullet points use Slack format (•)
+            line = re.sub(r'^[\-\*]\s+', '• ', line)
+            
+            # Convert numbered lists to Slack format
+            line = re.sub(r'^\d+\.\s+', '• ', line)
+        
+        result_lines.append(line)
     
-    # Convert markdown bold **text** to Slack *text*
-    text = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', text)
+    return '\n'.join(result_lines)
+
+
+@slack_app.action("proactive_research")
+def handle_proactive_research(ack, body, client):
+    ack()
     
-    # Ensure bullet points use Slack format (•)
-    text = re.sub(r'^[\-\*] ', '• ', text, flags=re.MULTILINE)
+    from tasks import trigger_research_with_context
     
-    # Convert numbered lists to Slack format
-    text = re.sub(r'^\d+\. ', '• ', text, flags=re.MULTILINE)
+    value = json.loads(body['actions'][0]['value'])
+    company = value['company']
+    meeting_summary = value['summary']
+    slack_user_id = body['user']['id']
+    channel_id = body['channel']['id']
     
-    return text
+    # Send initial message
+    result = client.chat_postMessage(
+        channel=slack_user_id,
+        text=f"🔍 Researching {company}... I'll have your brief ready in ~30 seconds"
+    )
+    
+    thread_ts = result['ts']
+    
+    # Trigger background research with thread context
+    trigger_research_with_context.delay(
+        company, 
+        slack_user_id, 
+        meeting_summary,
+        channel_id,
+        thread_ts
+    )
+
+@slack_app.action("skip_research")
+def handle_skip_research(ack, say):
+    ack()
+    say("👍 No problem, skipping this one.")
 
 # Slack commands
 @slack_app.command("/research")
-def handle_research_command(ack, say, command):
+def handle_research_command(ack, say, command, client):
     print("🎯 /research command received!")
     ack()
     
@@ -211,13 +358,32 @@ def handle_research_command(ack, say, command):
         say("Please provide a company name: `/research Acme Corp`")
         return
     
-    say(f"🔍 Researching {company}... this will take ~30 seconds")
+    # Send initial message
+    response = say(f"🔍 Researching {company}... this will take ~30 seconds")
     
     try:
         brief = research_company(company)
-        # Convert markdown and send with mrkdwn enabled
+        
+        # Convert markdown and post research in thread
         formatted_brief = convert_markdown_to_slack(brief)
-        say(f"*Research Brief: {company}*\n\n{formatted_brief}", mrkdwn=True)
+        result = client.chat_postMessage(
+            channel=command['channel_id'],
+            text=f"*Research Brief: {company}*\n\n{formatted_brief}\n\n_💬 Ask me follow-up questions in this thread! (Available for 48 hours)_",
+            mrkdwn=True
+        )
+        
+        # Store context for follow-up questions
+        thread_ts = result['ts']
+        context_key = f"{command['channel_id']}_{thread_ts}"
+        research_contexts[context_key] = {
+            'company': company,
+            'research_brief': brief,
+            'created_at': datetime.utcnow().isoformat(),
+            'conversation': []
+        }
+        
+        print(f"✅ Created research context: {context_key}")
+        
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         say(f"❌ Sorry, something went wrong: {str(e)}")
