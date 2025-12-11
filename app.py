@@ -208,16 +208,13 @@ def handle_message_events(event, say, client):
     # Only handle threaded messages (replies)
     thread_ts = event.get('thread_ts')
     if not thread_ts:
-        return  # Not a thread, ignore
+        return
     
     # Check if this thread has an active research context
     context_key = f"{event['channel']}_{thread_ts}"
     
-    # Reload contexts from file (in case Celery task updated it)
-    research_contexts.update(load_research_contexts())
-    
     if context_key not in research_contexts:
-        return  # Not a research thread, ignore
+        return
     
     context = research_contexts[context_key]
     
@@ -229,11 +226,18 @@ def handle_message_events(event, say, client):
             thread_ts=thread_ts
         )
         del research_contexts[context_key]
-        save_research_contexts(research_contexts)
         return
     
     # Get user's question
     user_question = event['text']
+    
+    # Show typing indicator
+    client.chat_postEphemeral(
+        channel=event['channel'],
+        user=event['user'],
+        thread_ts=thread_ts,
+        text="💭 Thinking..."
+    )
     
     # Generate response with context
     try:
@@ -288,7 +292,6 @@ Now the user has a follow-up question. Answer it based on the research context a
         conversation_history.append({"role": "assistant", "content": answer})
         context['conversation'] = conversation_history
         research_contexts[context_key] = context
-        save_research_contexts(research_contexts)
         
         print(f"✅ Answered follow-up in thread {thread_ts}")
         
@@ -608,7 +611,9 @@ def oauth_callback():
 
 # Run both Flask and Slack bot
 def run_flask():
-    flask_app.run(port=3000)
+    port = int(os.environ.get('PORT', 3000))
+    flask_app.run(host='0.0.0.0', port=port)
+
 
 @slack_app.action("research_meeting_0")
 @slack_app.action("research_meeting_1")
@@ -641,7 +646,7 @@ def handle_research_button(ack, body, say):
 
 if __name__ == "__main__":
     print("⚡️ Bot is running in Socket Mode!")
-    print("🌐 Flask OAuth server running on http://localhost:3000")
+    print(f"🌐 Flask OAuth server running on port {os.environ.get('PORT', 3000)}")
     
     # Start Flask in separate thread
     flask_thread = threading.Thread(target=run_flask, daemon=True)
