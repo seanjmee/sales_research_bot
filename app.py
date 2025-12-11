@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_sdk import WebClient
 from slack_bolt.adapter.socket_mode import SocketModeHandler
+import re
 
 
 load_dotenv()
@@ -50,6 +51,28 @@ Keep it concise - 3-4 paragraphs max."""
     
     return message.content[0].text
 
+# Add this helper function after the research_company function
+def convert_markdown_to_slack(text):
+    """Convert common markdown to Slack's mrkdwn format"""
+    # Convert headers to bold
+    text = re.sub(r'^### (.+)$', r'*\1*', text, flags=re.MULTILINE)
+    text = re.sub(r'^## (.+)$', r'*\1*', text, flags=re.MULTILINE)
+    text = re.sub(r'^# (.+)$', r'*\1*', text, flags=re.MULTILINE)
+    
+    # Convert markdown links [text](url) to Slack format <url|text>
+    text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<\2|\1>', text)
+    
+    # Convert markdown bold **text** to Slack *text*
+    text = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', text)
+    
+    # Convert markdown italic _text_ (but preserve Slack's _italic_ format)
+    # Only convert if not already Slack formatted
+    
+    # Ensure bullet points use Slack format
+    text = re.sub(r'^[\-\*] ', '• ', text, flags=re.MULTILINE)
+    
+    return text
+
 # Slash command with debug logging
 @app.command("/research")
 def handle_research_command(ack, say, command):
@@ -68,7 +91,9 @@ def handle_research_command(ack, say, command):
     
     try:
         brief = research_company(company)
-        say(f"*Research Brief: {company}*\n\n{brief}")
+        # Convert markdown and send with mrkdwn enabled
+        formatted_brief = convert_markdown_to_slack(brief)
+        say(f"*Research Brief: {company}*\n\n{formatted_brief}", mrkdwn=True)
     except Exception as e:
         print(f"❌ Error: {str(e)}")  # Debug log
         say(f"❌ Sorry, something went wrong: {str(e)}")
