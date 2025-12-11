@@ -7,6 +7,14 @@ from slack_bolt import App
 from slack_sdk import WebClient
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 import re
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+from flask import Flask, request
+import threading
+import json
+from datetime import datetime, timedelta
 
 
 load_dotenv()
@@ -25,21 +33,137 @@ client = WebClient(
     ssl=ssl_context
 )
 
-app = App(
+slack_app = App(
     token=os.environ.get("SLACK_BOT_TOKEN"),
     signing_secret=os.environ.get("SLACK_SIGNING_SECRET"),
     client=client
 )
-# Simple research function
+
+# Flask for OAuth callbacks
+flask_app = Flask(__name__)
+
+# Google OAuth config
+SCOPES = ['https://www.googleapis.com/auth/calendar.readonly']
+REDIRECT_URI = 'http://localhost:3000/oauth/callback'
+
+# Simple token storage (upgrade to DB later)
+def load_tokens():
+    try:
+        with open('user_tokens.json', 'r') as f:
+            content = f.read().strip()
+            if not content:
+                return {}
+            return json.loads(content)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def save_tokens(tokens):
+    with open('user_tokens.json', 'w') as f:
+        json.dump(tokens, f, indent=2)
+
+# Google Calendar functions
+def get_google_auth_url(slack_user_id):
+    """Generate Google OAuth URL"""
+    google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    
+    if not google_client_id or not google_client_secret:
+        raise ValueError("Google OAuth credentials not configured")
+    
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": google_client_id,
+                "client_secret": google_client_secret,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [REDIRECT_URI]
+            }
+        },
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI
+    )
+    
+    authorization_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent'
+    )
+    
+    # Store state with user_id for callback
+    tokens = load_tokens()
+    tokens[state] = {'slack_user_id': slack_user_id}
+    save_tokens(tokens)
+    
+    return authorization_url
+
+def get_upcoming_meetings(slack_user_id):
+    """Fetch upcoming meetings from Google Calendar"""
+    tokens = load_tokens()
+    
+    # Find user's credentials
+    user_creds = None
+    for state, data in tokens.items():
+        if data.get('slack_user_id') == slack_user_id and 'credentials' in data:
+            user_creds = data['credentials']
+            break
+    
+    if not user_creds:
+        return None
+    
+    try:
+        credentials = Credentials(
+            token=user_creds['token'],
+            refresh_token=user_creds.get('refresh_token'),
+            token_uri=user_creds['token_uri'],
+            client_id=user_creds['client_id'],
+            client_secret=user_creds['client_secret'],
+            scopes=user_creds['scopes']
+        )
+        
+        # Refresh token if expired
+        if credentials.expired and credentials.refresh_token:
+            credentials.refresh(Request())
+            # Update stored token
+            user_creds['token'] = credentials.token
+            tokens = load_tokens()
+            for state, data in tokens.items():
+                if data.get('slack_user_id') == slack_user_id and 'credentials' in data:
+                    data['credentials'] = user_creds
+                    break
+            save_tokens(tokens)
+        
+        service = build('calendar', 'v3', credentials=credentials)
+        
+        # Get events from next 24-48 hours
+        now = datetime.utcnow()
+        time_min = (now + timedelta(hours=24)).isoformat() + 'Z'
+        time_max = (now + timedelta(hours=48)).isoformat() + 'Z'
+        
+        events_result = service.events().list(
+            calendarId='primary',
+            timeMin=time_min,
+            timeMax=time_max,
+            maxResults=10,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+        
+        return events_result.get('items', [])
+    except Exception as e:
+        print(f"Error fetching calendar events: {e}")
+        return None
+
+# Research function
 def research_company(company_name):
     """Generate a simple research brief using Claude"""
-    prompt = f"""You are a sales research assistant supporting OutSystems sales and presales team in north america. We are pitching a low-code app dev platform for agentic AI workflows and app experiences. Create a brief company overview for {company_name} that would help a sales person prepare for a meeting.
+    prompt = f"""You are a sales research assistant. Create a brief company overview for {company_name} that would help a sales person prepare for a meeting.
 
-Include the following headings:
-- 📈What the company does
-- 📊Industry and size (estimate if needed)
-- 📰Recent news or developments
-- 💡Potential pain points a sales person should know
+Include:
+- What the company does
+- Industry and size (estimate if needed)
+- Recent news or developments
+- Potential pain points a sales person should know
 
 Keep it concise - 3-4 paragraphs max."""
 
@@ -51,7 +175,7 @@ Keep it concise - 3-4 paragraphs max."""
     
     return message.content[0].text
 
-# Add this helper function after the research_company function
+# Markdown conversion helper
 def convert_markdown_to_slack(text):
     """Convert common markdown to Slack's mrkdwn format"""
     # Convert headers to bold
@@ -65,20 +189,18 @@ def convert_markdown_to_slack(text):
     # Convert markdown bold **text** to Slack *text*
     text = re.sub(r'\*\*([^*]+)\*\*', r'*\1*', text)
     
-    # Convert markdown italic _text_ (but preserve Slack's _italic_ format)
-    # Only convert if not already Slack formatted
-    
-    # Ensure bullet points use Slack format
+    # Ensure bullet points use Slack format (•)
     text = re.sub(r'^[\-\*] ', '• ', text, flags=re.MULTILINE)
+    
+    # Convert numbered lists to Slack format
+    text = re.sub(r'^\d+\. ', '• ', text, flags=re.MULTILINE)
     
     return text
 
-# Slash command with debug logging
-@app.command("/research")
+# Slack commands
+@slack_app.command("/research")
 def handle_research_command(ack, say, command):
-    print("🎯 /research command received!")  # Debug log
-    print(f"Command text: {command['text']}")  # Debug log
-    
+    print("🎯 /research command received!")
     ack()
     
     company = command['text'].strip()
@@ -95,21 +217,81 @@ def handle_research_command(ack, say, command):
         formatted_brief = convert_markdown_to_slack(brief)
         say(f"*Research Brief: {company}*\n\n{formatted_brief}", mrkdwn=True)
     except Exception as e:
-        print(f"❌ Error: {str(e)}")  # Debug log
+        print(f"❌ Error: {str(e)}")
         say(f"❌ Sorry, something went wrong: {str(e)}")
 
-# Respond to "hello"
-@app.message("hello")
-def say_hello(message, say):
-    user = message['user']
-    say(f"Hey <@{user}>! 👋 Try `/research Company Name` to test me out.")
+@slack_app.command("/connect-calendar")
+def handle_connect_calendar(ack, say, command):
+    print("📅 /connect-calendar command received!")
+    ack()
+    
+    try:
+        # Check if Google OAuth credentials are configured
+        google_client_id = os.environ.get("GOOGLE_CLIENT_ID")
+        google_client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+        
+        if not google_client_id or not google_client_secret:
+            say("❌ Google Calendar integration is not configured. Please set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` environment variables.")
+            return
+        
+        slack_user_id = command['user_id']
+        auth_url = get_google_auth_url(slack_user_id)
+        
+        say(f"📅 Click here to connect your Google Calendar:\n{auth_url}\n\nI'll be able to see your upcoming meetings and proactively research attendees!")
+    except Exception as e:
+        print(f"❌ Error in /connect-calendar: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        say(f"❌ Sorry, something went wrong connecting your calendar: {str(e)}")
 
-# Handle bot mentions - research company or show help
-@app.event("app_mention")
+@slack_app.command("/upcoming-meetings")
+def handle_upcoming_meetings(ack, say, command):
+    print("📅 /upcoming-meetings command received!")
+    ack()
+    
+    slack_user_id = command['user_id']
+    meetings = get_upcoming_meetings(slack_user_id)
+    
+    if meetings is None:
+        say("❌ You haven't connected your calendar yet. Use `/connect-calendar` first!")
+        return
+    
+    if not meetings:
+        say("No meetings found in the next 24-48 hours.")
+        return
+    
+    try:
+        message = "*📅 Your upcoming meetings (next 24-48 hours):*\n\n"
+        for event in meetings:
+            start = event['start'].get('dateTime', event['start'].get('date'))
+            summary = event.get('summary', 'No title')
+            attendees = event.get('attendees', [])
+            
+            message += f"• *{summary}*\n"
+            message += f"  Time: {start}\n"
+            if attendees:
+                message += f"  Attendees: {len(attendees)} people\n"
+            message += "\n"
+        
+        say(message, mrkdwn=True)
+    except Exception as e:
+        print(f"Error formatting meetings: {e}")
+        say(f"❌ Error displaying meetings: {str(e)}")
+
+@slack_app.message(re.compile(r"^(hello|hi|hey)$", re.IGNORECASE))
+def say_hello(message, say):
+    print(f"👋 Hello message received from user {message.get('user')}")
+    user = message['user']
+    say(f"Hey <@{user}>! 👋\n\nCommands:\n• `/connect-calendar` - Connect Google Calendar\n• `/upcoming-meetings` - See your meetings\n• `/research Company Name` - Research a company")
+
+# Handle bot mentions
+@slack_app.event("app_mention")
 def handle_mention(event, say):
     """Handle bot mentions - research company or show help"""
     text = event.get('text', '').strip()
     user = event.get('user')
+    
+    print(f"📢 Bot mentioned by user {user}: {text}")
     
     # Remove bot mention
     text = re.sub(r'<@[^>]+>', '', text).strip().lower()
@@ -120,7 +302,9 @@ def handle_mention(event, say):
         say(f"Hey <@{user}>! 👋 I'm your sales research assistant.\n\n"
             "*What I can do:*\n"
             "• Research companies - mention me with a company name: `@me Acme Corp`\n"
-            "• Use slash command: `/research Company Name`\n\n"
+            "• Use slash command: `/research Company Name`\n"
+            "• Connect calendar: `/connect-calendar`\n"
+            "• View meetings: `/upcoming-meetings`\n\n"
             "*Example:* `@me Microsoft` or `/research Microsoft`")
         return
     
@@ -130,13 +314,83 @@ def handle_mention(event, say):
     
     try:
         brief = research_company(company)
+        # Convert markdown and send with mrkdwn enabled
         formatted_brief = convert_markdown_to_slack(brief)
         say(f"*Research Brief: {company}*\n\n{formatted_brief}", mrkdwn=True)
     except Exception as e:
         print(f"❌ Error: {str(e)}")
         say(f"❌ Sorry, something went wrong: {str(e)}")
 
+# Flask OAuth callback
+@flask_app.route('/oauth/callback')
+def oauth_callback():
+    state = request.args.get('state')
+    code = request.args.get('code')
+    
+    tokens = load_tokens()
+    
+    if state not in tokens:
+        return "Error: Invalid state", 400
+    
+    slack_user_id = tokens[state]['slack_user_id']
+    
+    # Exchange code for tokens
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": os.environ.get("GOOGLE_CLIENT_ID"),
+                "client_secret": os.environ.get("GOOGLE_CLIENT_SECRET"),
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "redirect_uris": [REDIRECT_URI]
+            }
+        },
+        scopes=SCOPES,
+        redirect_uri=REDIRECT_URI,
+        state=state
+    )
+    
+    flow.fetch_token(code=code)
+    credentials = flow.credentials
+    
+    # Store credentials
+    tokens[state]['credentials'] = {
+        'token': credentials.token,
+        'refresh_token': credentials.refresh_token,
+        'token_uri': credentials.token_uri,
+        'client_id': credentials.client_id,
+        'client_secret': credentials.client_secret,
+        'scopes': credentials.scopes
+    }
+    save_tokens(tokens)
+    
+    # Notify user in Slack via DM
+    try:
+        # Open DM conversation with user
+        conversation = slack_app.client.conversations_open(users=[slack_user_id])
+        channel_id = conversation['channel']['id']
+        
+        slack_app.client.chat_postMessage(
+            channel=channel_id,
+            text="✅ Calendar connected! I can now see your upcoming meetings. Use `/upcoming-meetings` to test it out."
+        )
+    except Exception as e:
+        print(f"Error posting to Slack: {e}")
+    
+    return "✅ Calendar connected! You can close this window and return to Slack."
+
+# Run both Flask and Slack bot
+def run_flask():
+    flask_app.run(port=3000)
+
 if __name__ == "__main__":
     print("⚡️ Bot is running in Socket Mode!")
-    handler = SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN"))
+    print("🌐 Flask OAuth server running on http://localhost:3000")
+    
+    # Start Flask in separate thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    # Start Slack bot
+    handler = SocketModeHandler(slack_app, os.environ.get("SLACK_APP_TOKEN"))
     handler.start()

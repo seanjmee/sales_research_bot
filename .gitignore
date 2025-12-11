@@ -2,6 +2,7 @@
 .env
 .env.local
 .env.*.local
+user_tokens.json
 
 # Python
 __pycache__/
